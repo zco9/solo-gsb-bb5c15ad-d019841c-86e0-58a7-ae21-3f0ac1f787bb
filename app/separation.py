@@ -55,6 +55,7 @@ class Flight:
     flight_no: str
     scheduled_off: datetime  # always tz-aware, converted to UTC
     wake: str
+    locked: bool = False  # trial must keep this flight exactly on scheduled_off
 
     @property
     def t(self) -> int:
@@ -159,12 +160,60 @@ class TrialItem:
     triggered_by: str | None  # flight number of the leader that forced the pushback
     closure_hit: bool  # a closure window forced (further) delay
     closure_window: ClosureWindow | None  # the last window that pushed this flight
+    locked: bool = False  # immovable flight: kept exactly on its scheduled time
     capacity_hit: bool = False  # the rolling capacity limit forced (further) delay
     capacity_window_seconds: int | None = None
     capacity_max_departures: int | None = None
     capacity_anchor: str | None = None  # flight anchoring the capacity window
     capacity_window_start: datetime | None = None  # [anchor_off, +window)
     capacity_window_end: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TrialBlocker:
+    """The first locked flight that cannot stay on its scheduled time.
+
+    Computed in stable order, this is the earliest locked flight that the
+    wake-separation / closure-window / rolling-capacity requirements would
+    push to a later instant. It is *not* moved and no violating time is
+    proposed; later flights receive no suggestions either.
+    ``required_earliest_off`` is the earliest safe time after every
+    constraint was iterated, and ``constraint`` names the first constraint
+    type that demanded a push (``wake`` / ``closure`` / ``capacity``).
+    """
+
+    flight_no: str
+    wake: str
+    scheduled_off: datetime
+    position: int
+    constraint: str  # "wake" | "closure" | "capacity"
+    required_earliest_off: datetime
+    # wake detail
+    triggered_by: str | None
+    required_gap_seconds: int | None
+    # closure detail
+    closure_hit: bool
+    closure_window: ClosureWindow | None
+    # capacity detail
+    capacity_hit: bool
+    capacity_window_seconds: int | None
+    capacity_max_departures: int | None
+    capacity_anchor: str | None
+    capacity_window_start: datetime | None
+    capacity_window_end: datetime | None
+
+
+@dataclass(slots=True)
+class TrialRunwayResult:
+    """A runway's trial outcome: either a full feasible proposal or a
+    feasible prefix followed by the first infeasible locked flight."""
+
+    items: list[TrialItem]
+    blocked: TrialBlocker | None = None
+
+    @property
+    def feasible(self) -> bool:
+        return self.blocked is None
 
 
 def build_matrix(
@@ -319,7 +368,7 @@ def trial_reschedule(
     matrix: dict[tuple[str, str], int],
     windows: list[ClosureWindow] | None = None,
     capacity: Capacity | None = None,
-) -> list[TrialItem]:
+) -> TrialRunwayResult:
     """Greedily push flights back to the earliest safe time, keeping order.
 
     Every flight is placed at the earliest instant that (a) is not earlier
@@ -336,6 +385,14 @@ def trial_reschedule(
     two constraints iterate together until both hold. Delays cascade to
     successors. Original schedules are never rewritten; only
     :class:`TrialItem` proposals are returned.
+
+    A **locked** flight is immovable: it must keep its ``scheduled_off``.
+    When the constraints above would push a locked flight later, processing
+    stops immediately — that flight is reported once as a
+    :class:`TrialBlocker` (with the first conflicting constraint and the
+    earliest compliant time), it is not moved, no violating time is produced,
+    and no later flights receive suggestions. Only the feasible prefix is
+    returned. Unlocked flights are still only ever moved later.
     """
     ordered = sort_flights(flights)
     wins = sort_windows(windows or [])
@@ -345,16 +402,17 @@ def trial_reschedule(
     for position, flight in enumerate(ordered, start=1):
         adjusted_t = flight.t
         triggered_by: str | None = None
+        wake_required = 0
         if prev is not None:
-            required = required_gap(matrix, prev.wake, flight.wake)
-            earliest = prev_adjusted_t + required
+            wake_required = required_gap(matrix, prev.wake, flight.wake)
+            earliest = prev_adjusted_t + wake_required
             if adjusted_t < earliest:
                 adjusted_t = earliest
                 triggered_by = prev.flight_no
         closure_hit = False
         closure_window: ClosureWindow | None = None
         capacity_hit = False
-        capacity_anchor: Flight | None = None
+        capacity_anchor: TrialItem | None = None
         capacity_window_t = 0
         while True:
             pushed = False
@@ -378,6 +436,59 @@ def trial_reschedule(
                     pushed = True
             if not pushed:
                 break
+
+        if flight.locked and adjusted_t > flight.t:
+            # Immovable flight: name the first constraint that demanded a
+            # push (wake, then closure, then capacity) and stop the runway.
+            if triggered_by is not None:
+                constraint = "wake"
+            elif closure_hit:
+                constraint = "closure"
+            else:
+                constraint = "capacity"
+            blocked = TrialBlocker(
+                flight_no=flight.flight_no,
+                wake=flight.wake,
+                scheduled_off=flight.scheduled_off,
+                position=position,
+                constraint=constraint,
+                required_earliest_off=datetime.fromtimestamp(
+                    adjusted_t, tz=timezone.utc
+                ),
+                triggered_by=triggered_by,
+                required_gap_seconds=wake_required if triggered_by is not None else None,
+                closure_hit=closure_hit,
+                closure_window=closure_window,
+                capacity_hit=capacity_hit,
+                capacity_window_seconds=(
+                    capacity.window_seconds
+                    if capacity_hit and capacity is not None
+                    else None
+                ),
+                capacity_max_departures=(
+                    capacity.max_departures
+                    if capacity_hit and capacity is not None
+                    else None
+                ),
+                capacity_anchor=(
+                    capacity_anchor.flight_no if capacity_anchor is not None else None
+                ),
+                capacity_window_start=(
+                    datetime.fromtimestamp(capacity_window_t, tz=timezone.utc)
+                    if capacity_anchor is not None
+                    else None
+                ),
+                capacity_window_end=(
+                    datetime.fromtimestamp(
+                        capacity_window_t + capacity.window_seconds,
+                        tz=timezone.utc,
+                    )
+                    if capacity_anchor is not None and capacity is not None
+                    else None
+                ),
+            )
+            return TrialRunwayResult(items=items, blocked=blocked)
+
         items.append(
             TrialItem(
                 flight_no=flight.flight_no,
@@ -389,6 +500,7 @@ def trial_reschedule(
                 triggered_by=triggered_by,
                 closure_hit=closure_hit,
                 closure_window=closure_window,
+                locked=flight.locked,
                 capacity_hit=capacity_hit,
                 capacity_window_seconds=(
                     capacity.window_seconds if capacity is not None else None
@@ -416,4 +528,4 @@ def trial_reschedule(
         )
         prev = flight
         prev_adjusted_t = adjusted_t
-    return items
+    return TrialRunwayResult(items=items, blocked=None)

@@ -620,3 +620,252 @@ def test_batch_roundtrip_preserves_capacity(client):
     assert t36l["items"] == next(
         x for x in t["runways"] if x["runway"] == "36L"
     )["items"]
+
+
+# ---------- immovable (locked) flights ----------
+
+
+def _lflight(no: str, off: str, wake: str, locked: bool) -> dict:
+    return {"flight_no": no, "scheduled_off": off, "wake": wake, "locked": locked}
+
+
+def test_validate_without_locked_keeps_legacy_shape(client):
+    # no locked field anywhere -> no lock keys in the response
+    data = client.post("/api/v1/validate", json=VALIDATE_BODY).json()
+    assert "total_locked" not in data
+    assert "locked_flights" not in data["runways"][0]
+
+
+def test_trial_without_locked_keeps_legacy_shape(client):
+    data = client.post("/api/v1/trial", json=VALIDATE_BODY).json()
+    assert "total_locked" not in data
+    rw = data["runways"][0]
+    assert "locked_flights" not in rw and "blocked" not in rw
+    assert "locked" not in rw["items"][0]
+
+
+def test_validate_echoes_locked_flights_but_checks_original_plan(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:00Z", "J"),
+                    _lflight("CA2", "2026-09-18T00:01:00Z", "M", True),
+                    _lflight("CA3", "2026-09-18T00:05:00Z", "M", False),
+                ],
+            }
+        ]
+    }
+    data = client.post("/api/v1/validate", json=body).json()
+    assert data["total_locked"] == 1
+    rw = data["runways"][0]
+    # locking changes nothing about validation: the 60 s gap still violates
+    assert rw["violation_count"] == 1
+    assert rw["locked_flights"] == [
+        {
+            "position": 2,
+            "flight_no": "CA2",
+            "scheduled_off": "2026-09-18T00:01:00Z",
+            "wake": "M",
+        }
+    ]
+
+
+def test_trial_locked_flight_keeps_scheduled_when_feasible(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:00Z", "J"),
+                    _lflight("CA2", "2026-09-18T00:03:00Z", "M", True),
+                ],
+            }
+        ]
+    }
+    data = client.post("/api/v1/trial", json=body).json()
+    assert data["total_locked"] == 1
+    rw = data["runways"][0]
+    assert rw["blocked"] is None
+    items = {i["flight_no"]: i for i in rw["items"]}
+    assert items["CA2"]["locked"] is True
+    assert items["CA2"]["adjusted_off"] == "2026-09-18T00:03:00Z"
+    assert items["CA2"]["delay_seconds"] == 0
+    assert items["CA1"]["locked"] is False
+    assert [f["flight_no"] for f in rw["locked_flights"]] == ["CA2"]
+
+
+def test_trial_locked_flight_blocked_by_wake_stops_runway(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:00Z", "J"),
+                    _lflight("CA2", "2026-09-18T00:01:00Z", "M", True),
+                    _flight("CA3", "2026-09-18T00:10:00Z", "M"),
+                ],
+            }
+        ]
+    }
+    data = client.post("/api/v1/trial", json=body).json()
+    rw = data["runways"][0]
+    # feasible prefix: only CA1 gets a suggestion
+    assert [i["flight_no"] for i in rw["items"]] == ["CA1"]
+    assert rw["total"] == 3  # all flights still counted
+    blocked = rw["blocked"]
+    assert blocked["flight_no"] == "CA2"
+    assert blocked["position"] == 2
+    assert blocked["constraint"] == "wake"
+    assert blocked["required_earliest_off"] == "2026-09-18T00:03:00Z"
+    assert blocked["triggered_by"] == "CA1"
+    assert blocked["required_gap_seconds"] == 180
+    assert blocked["closure_hit"] is False
+    assert blocked["closure_window"] is None
+    # no capacity configured on this runway -> capacity detail omitted
+    assert "capacity_hit" not in blocked
+
+
+def test_trial_locked_flight_blocked_by_closure(client):
+    body = {
+        "runways": [
+            {
+                "runway": "09",
+                "flights": [
+                    _lflight("CA1", "2026-09-18T00:00:30Z", "M", True),
+                ],
+                "closures": [
+                    {"start": "2026-09-18T00:00:00Z", "end": "2026-09-18T00:01:00Z"}
+                ],
+            }
+        ]
+    }
+    data = client.post("/api/v1/trial", json=body).json()
+    rw = data["runways"][0]
+    assert rw["items"] == []
+    blocked = rw["blocked"]
+    assert blocked["flight_no"] == "CA1"
+    assert blocked["position"] == 1
+    assert blocked["constraint"] == "closure"
+    assert blocked["required_earliest_off"] == "2026-09-18T00:01:00Z"
+    assert blocked["triggered_by"] is None
+    assert blocked["closure_hit"] is True
+    assert blocked["closure_window"] == {
+        "start": "2026-09-18T00:00:00Z",
+        "end": "2026-09-18T00:01:00Z",
+    }
+
+
+def test_trial_locked_flight_blocked_by_capacity(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:00Z", "M"),
+                    _flight("CA2", "2026-09-18T00:00:30Z", "M"),
+                    _lflight("CA3", "2026-09-18T00:00:59Z", "M", True),
+                ],
+                "capacity": {"window_seconds": 60, "max_departures": 2},
+            }
+        ],
+        "matrix": [{"leader": "M", "follower": "M", "seconds": 0}],
+    }
+    data = client.post("/api/v1/trial", json=body).json()
+    rw = data["runways"][0]
+    assert [i["flight_no"] for i in rw["items"]] == ["CA1", "CA2"]
+    blocked = rw["blocked"]
+    assert blocked["flight_no"] == "CA3"
+    assert blocked["constraint"] == "capacity"
+    assert blocked["required_earliest_off"] == "2026-09-18T00:01:00Z"
+    assert blocked["capacity_hit"] is True
+    assert blocked["capacity_anchor"] == "CA1"
+    assert blocked["capacity_window_seconds"] == 60
+    assert blocked["capacity_max_departures"] == 2
+    assert blocked["capacity_window"] == {
+        "start": "2026-09-18T00:00:00Z",
+        "end": "2026-09-18T00:01:00Z",
+    }
+
+
+def test_trial_blocked_runway_persists_prefix_and_blocker(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:00Z", "J"),
+                    _lflight("CA2", "2026-09-18T00:01:00Z", "M", True),
+                    _flight("CA3", "2026-09-18T00:10:00Z", "M"),
+                ],
+            }
+        ]
+    }
+    t = client.post("/api/v1/trial", json=body).json()
+    got = client.get(f"/api/v1/batches/{t['batch_id']}").json()
+    assert got["total_locked"] == 1
+    rw = got["runways"][0]
+    assert rw["total"] == 3
+    assert [i["flight_no"] for i in rw["items"]] == ["CA1"]
+    assert rw["locked_flights"][0]["flight_no"] == "CA2"
+    assert rw["blocked"]["flight_no"] == "CA2"
+    assert rw["blocked"]["constraint"] == "wake"
+    assert rw["blocked"]["required_earliest_off"] == "2026-09-18T00:03:00Z"
+
+
+def test_validate_batch_roundtrip_includes_locked(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _lflight("CA1", "2026-09-18T00:00:00Z", "H", True),
+                    _flight("CA2", "2026-09-18T00:05:00Z", "M"),
+                ],
+            }
+        ]
+    }
+    v = client.post("/api/v1/validate", json=body).json()
+    got = client.get(f"/api/v1/batches/{v['batch_id']}").json()
+    assert got["total_locked"] == 1
+    assert got["runways"][0]["locked_flights"][0]["flight_no"] == "CA1"
+
+
+def test_explicit_locked_false_still_echoes_lock_shape(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _lflight("CA1", "2026-09-18T00:00:00Z", "M", False),
+                    _flight("CA2", "2026-09-18T00:01:00Z", "M"),
+                ],
+            }
+        ]
+    }
+    v = client.post("/api/v1/validate", json=body).json()
+    # field was explicitly provided -> lock shape present, but nobody locked
+    assert v["total_locked"] == 0
+    assert v["runways"][0]["locked_flights"] == []
+
+    t = client.post("/api/v1/trial", json=body).json()
+    assert t["total_locked"] == 0
+    rw = t["runways"][0]
+    assert rw["blocked"] is None
+    assert all(i["locked"] is False for i in rw["items"])
+
+
+def test_locked_must_be_boolean(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    {"flight_no": "CA1", "scheduled_off": "2026-09-18T00:00:00Z",
+                     "wake": "M", "locked": "yes"}
+                ],
+            }
+        ]
+    }
+    assert client.post("/api/v1/trial", json=body).status_code == 422

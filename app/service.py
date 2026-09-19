@@ -8,7 +8,7 @@ from .separation import (
     ClosureConflict,
     ClosureWindow,
     Flight,
-    TrialItem,
+    TrialRunwayResult,
     Violation,
     build_matrix,
     find_capacity_violations,
@@ -30,11 +30,33 @@ def _build_runway_flights(req: WakeRequest) -> dict[str, list[Flight]]:
                 flight_no=f.flight_no,
                 scheduled_off=ensure_utc(f.scheduled_off),
                 wake=f.wake.value,
+                locked=f.locked,
             )
             for f in rw.flights
         ]
         payloads[rw.runway] = sort_flights(flights)
     return payloads
+
+
+def _runways_with_locked_input(req: WakeRequest) -> set[str]:
+    """Runways whose request explicitly carried the ``locked`` field on at
+    least one flight — only those runways echo lock detail, so requests that
+    never mention ``locked`` keep the legacy response shape."""
+    runways: set[str] = set()
+    for rw in req.runways:
+        if any("locked" in f.model_fields_set for f in rw.flights):
+            runways.add(rw.runway)
+    return runways
+
+
+def _locked_flights_by_runway(
+    payloads: dict[str, list[Flight]],
+) -> dict[str, list[str]]:
+    """Stable-order flight numbers of the locked flights per runway."""
+    return {
+        runway: [f.flight_no for f in flights if f.locked]
+        for runway, flights in payloads.items()
+    }
 
 
 def _build_runway_windows(req: WakeRequest) -> dict[str, list[ClosureWindow]]:
@@ -78,6 +100,8 @@ def run_validate(req: WakeRequest) -> tuple[
     dict[str, list[Violation]],
     dict[str, list[ClosureConflict]],
     dict[str, list],
+    set[str],
+    dict[str, list[str]],
 ]:
     payloads = _build_runway_flights(req)
     windows = _build_runway_windows(req)
@@ -95,6 +119,8 @@ def run_validate(req: WakeRequest) -> tuple[
         runway: find_capacity_violations(flights, capacities.get(runway))
         for runway, flights in payloads.items()
     }
+    locked_runways = _runways_with_locked_input(req)
+    locked_flights = _locked_flights_by_runway(payloads)
     return (
         payloads,
         matrix,
@@ -103,6 +129,8 @@ def run_validate(req: WakeRequest) -> tuple[
         violations,
         conflicts,
         capacity_violations,
+        locked_runways,
+        locked_flights,
     )
 
 
@@ -111,7 +139,9 @@ def run_trial(req: WakeRequest) -> tuple[
     dict[tuple[str, str], int],
     dict[str, list[ClosureWindow]],
     dict[str, Capacity],
-    dict[str, list[TrialItem]],
+    dict[str, TrialRunwayResult],
+    set[str],
+    dict[str, list[str]],
 ]:
     payloads = _build_runway_flights(req)
     windows = _build_runway_windows(req)
@@ -126,7 +156,9 @@ def run_trial(req: WakeRequest) -> tuple[
         )
         for runway, flights in payloads.items()
     }
-    return payloads, matrix, windows, capacities, trials
+    locked_runways = _runways_with_locked_input(req)
+    locked_flights = _locked_flights_by_runway(payloads)
+    return payloads, matrix, windows, capacities, trials, locked_runways, locked_flights
 
 
 def nested_matrix(matrix: dict[tuple[str, str], int]) -> dict[str, dict[str, int]]:

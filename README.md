@@ -2,15 +2,25 @@
 
 基于 **Python + FastAPI + SQLite** 的跑道离场尾流（wake turbulence）间隔校验服务。
 客户端按跑道提交航班计划与前机—后机最小间隔矩阵，并可为每条跑道配置**临时关闭窗口**
-与**滚动容量约束**，服务端完成两件事：
+与**滚动容量约束**；航班可选 **`locked=true`（不可移动航班）**。服务端完成两件事：
 
 1. **间隔校验（validate）**：按计划离场时刻、航班号稳定排序，列出同跑道相邻航班的间隔违规、
    计划离场时刻落入关闭窗口的航班及其命中窗口，以及滚动容量约束的超限航班、触发窗口与
-   最早合规时刻。
+   最早合规时刻。**锁定不影响校验结论**——仍按原计划逐项校验，仅额外回显该跑道的
+   `locked_flights`（位次、航班号、计划时刻、尾流等级）与批次级 `total_locked`。
 2. **试排（trial）**：保持原航班顺序，逐项把航班推迟到**同时满足尾流间隔、滚动容量约束且
    避开关闭窗口**的最早安全时刻；容量/关闭导致的延误沿队列向后级联，
    容量推迟后若落入关闭窗口会继续迭代避让，**原计划时刻绝不改写**。
    返回调整后时刻、单项延误、触发前机、容量与关闭窗口命中情况。
+   **锁定航班必须保持 `scheduled_off`**：稳定顺序计算中，若尾流、关闭窗口或容量要求会把
+   首个锁定航班推迟，则**不挪动它、也不生成违反约束的时刻**，而在该跑道返回
+   `blocked`（首个不可行航班、`constraint` 冲突约束、`required_earliest_off` 所需最早时刻
+   及对应约束明细），该航班及其后的航班**不再给出建议**，`items` 只含可行前缀；
+   可行前缀照常持久化、可用批次 ID 回查。
+
+**兼容形状**：未在任何航班上传 `locked` 字段时，validate/trial/批次回查的响应与旧版本
+完全一致（不出现 `locked`、`locked_flights`、`blocked`、`total_locked` 字段）；显式传了
+`locked`（即使都是 `false`）才回显锁定相关字段。
 
 每次请求（含输入排序结果、关闭窗口、容量配置、违规/冲突/试排结论）都会持久化到 SQLite，
 可用批次 ID 回查。
@@ -72,9 +82,25 @@ docker compose up -d --build
 - `flight_no`：航班号，**整个请求内唯一**（跑道内、跑道间均不可重复）。
 - `scheduled_off`：计划离场时刻，ISO 8601 且**必须带时区**（`Z` 或 `+08:00` 偏移），服务端统一按 UTC 处理。
 - `wake`：尾流等级，四档 —— `L` 轻型 / `M` 中型 / `H` 重型 / `J` 超重型。
+- `locked`（可选，**严格布尔值**，缺省 `false`）：是否为**不可移动航班**。
+  validate 不改变任何校验逻辑，只在该跑道回显 `locked_flights`；trial 中锁定航班必须保持
+  `scheduled_off`（详见下文 trial 的锁定语义）。该字段必须是真正的 JSON `true`/`false`，
+  传 `"true"`、`1` 等会被拒绝（`422`）。
 - 跑道按其标识独立排序与校验；排序规则为 `(scheduled_off 升序, flight_no 升序)` 的稳定排序。
 - 仅检查排序后**相邻**两架航班（单跑道离场的运行惯例）：前机尾流等级 → 后机尾流等级查矩阵，
   实际间隔 < 要求间隔即违规，返回要求秒数、实际秒数与缺口秒数。
+
+#### 不可移动航班回显（validate）
+
+只要某跑道的请求里**任意航班显式携带了 `locked` 字段**，该跑道响应就带：
+
+- `locked_flights`：稳定排序位次上所有 `locked=true` 航班的列表，每项含
+  `position` / `flight_no` / `scheduled_off`（UTC）/ `wake`；
+  没有锁定航班时为空列表 `[]`。
+
+批次级在**任意航班显式携带 `locked` 时**汇总 `total_locked`（全批锁定航班总数，可为 0）。
+校验仍完全基于原计划：被锁定的航班若本身违反尾流/关闭/容量约束，仍会照常出现在对应
+违规/冲突/超限列表中——锁定只约束 trial，不豁免 validate。
 
 #### 跑道临时关闭窗口（可选字段 `closures`）
 
@@ -131,11 +157,44 @@ validate 额外返回**关闭冲突**：凡计划离场时刻落在某个窗口�
   `triggered_by`（触发本次推迟的直接前机航班号；未因尾流推迟为 `null`）、
   `closure_hit`（是否因关闭窗口产生了额外推迟）与
   `closure_window`（最后命中并导致推迟的窗口，未命中为 `null`）；
+  该跑道显式携带 `locked` 时每项还返回 `locked`（该航班是否锁定；锁定且可行时
+  `adjusted_off == scheduled_off`、`delay_seconds == 0`）；
   **配置了 capacity 的跑道**还返回 `capacity_hit`、`capacity_anchor`（容量窗口锚机航班号）、
   `capacity_window_seconds` / `capacity_max_departures` 与
   `capacity_window`（触发容量推迟的半开窗口 `[锚机调整时刻, +window_seconds)`，
   未因容量推迟为 `null`），跑道对象同时原样回显 `capacity`；
 - 该接口只返回试排建议，`scheduled_off` 原值原样返回，数据库中也同时保存原计划。
+
+#### 不可移动航班（trial 的 `locked` 语义）
+
+按稳定顺序逐项计算时，每架航班仍取满足尾流/关闭/容量的最早时刻，但对锁定航班：
+
+- **锁定航班必须保持 `scheduled_off`**；未锁定航班仍**只可后移、绝不提前**。
+- 若尾流间隔、关闭窗口或容量要求会把**首个**锁定航班推迟，则立即停止该跑道：
+  - **不挪动**该锁定航班，也**不生成**任何违反约束的 `adjusted_off`；
+  - 跑道对象返回 `blocked`，描述该不可行航班；
+  - 该航班及它之后的航班**不再给出试排建议**，`items` 只保留此前的**可行前缀**。
+- `blocked` 字段：
+
+  | 字段 | 含义 |
+  | --- | --- |
+  | `flight_no` / `wake` / `scheduled_off` / `position` | 首个不可行的锁定航班（位次为稳定排序位次） |
+  | `constraint` | 首个要求推迟的约束：`wake`（尾流）/ `closure`（关闭窗口）/ `capacity`（容量）；判定优先级为尾流 → 关闭 → 容量 |
+  | `required_earliest_off` | 三类约束交替迭代后该航班的**最早合规时刻**（UTC） |
+  | `triggered_by` / `required_gap_seconds` | 尾流约束明细：要求保持间隔的直接前机与要求秒数；非尾流约束时为 `null` |
+  | `closure_hit` / `closure_window` | 是否同时命中关闭窗口及最后一个导致推迟的窗口 |
+  | `capacity_hit` / `capacity_anchor` / `capacity_window_seconds` / `capacity_max_departures` / `capacity_window` | 容量约束明细（仅该跑道配置了 capacity 时出现这些键，规则与 `items` 一致） |
+
+- 跑道在显式携带 `locked` 时还回显 `locked_flights`（同 validate）与
+  `blocked`（可行时为 `null`）；`total`/`order` 仍是**全部**航班，`items` 在阻塞时短于总数，
+  `delayed_count` / `total_delay_seconds` / `max_delay_seconds` 只统计可行前缀。
+- 批次级在显式携带 `locked` 时汇总 `total_locked`。
+- 可行前缀与 `blocked` 都持久化，`GET /api/v1/batches/{batch_id}` 原样回查；
+  后续跑道（其它 runway）互不影响，各自独立给出完整建议或阻塞结论。
+
+> 注意：`constraint` 给出的是“第一个要求后移”的约束；当尾流把航班推进关闭窗口、或容量推迟
+> 撞上关闭窗口时，`required_earliest_off` 是**所有约束迭代完毕**后的最终最早时刻，
+> `closure_hit` / `capacity_hit` 同时反映其余命中情况。
 
 ### `POST` 边界示例
 
@@ -145,13 +204,17 @@ validate 额外返回**关闭冲突**：凡计划离场时刻落在某个窗口�
 | 第三架落入 | 00:00、00:30、**00:59** | CA3 超限；触发窗口 `[00:00,01:00)`，`departures_in_window=3`，最早合规 `01:00` | CA3 → **01:00**（`capacity_hit=true`，锚机 CA1） |
 | 容量推迟撞关闭 | 00:00、00:30、00:59；关闭 `[01:00,01:40)` | 同上 | CA3 → 01:00 撞窗口 → **01:40**（`capacity_hit` 与 `closure_hit` 均为 `true`） |
 | 窗口滑动 | 00:00、00:40、01:20、02:00（窗口 90 秒、2 架） | 第 3 架（锚机第 1 架，跨度 80 < 90）、第 4 架（锚机第 2 架，跨度 80 < 90）各一次 | 逐项推迟到锚机 + 90 秒，向后级联 |
+| 锁定可保持 | 00:00、**00:03:00(locked)**（J→M 180 秒） | 第 2 架无违规 | 锁定航班 00:03 已是合规时刻 → 保持不动 |
+| 锁定不可后移 | 00:00、**00:01:00(locked)**（J→M 180 秒） | 第 2 架尾流违规（照常报告） | `blocked` 指向第 2 架，`constraint="wake"`，最早时刻 **00:03:00**；`items` 仅含第 1 架，其后不建议 |
 
 ### `GET /api/v1/batches/{batch_id}` — 批次回查
 
 两个 POST 接口的返回都带 `batch_id`，可随时回查当时的输入顺序、生效矩阵、关闭窗口、
 容量配置与结论（validate 的违规/关闭冲突/容量超限 / trial 的试排结果），字段与 POST 响应一致：
 配置了 capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的跑道**不出现**容量字段，
-保持旧响应形状。不存在的 ID 返回 `404`。
+保持旧响应形状。trial 的**可行前缀**（含每项 `locked`）与 `blocked`（若有）一并回查；
+仅当原请求显式携带 `locked` 时，回查结果才含 `locked_flights` / `blocked` / `total_locked`。
+不存在的 ID 返回 `404`。
 
 ### 间隔矩阵（可选字段 `matrix`）
 
@@ -181,7 +244,7 @@ validate 额外返回**关闭冲突**：凡计划离场时刻落在某个窗口�
 ### 错误约定
 
 - `422`：请求体不合法（缺时区、航班号/跑道重复、尾流等级非法、矩阵条目非法、
-  关闭窗口结束不晚于开始或彼此重叠、容量字段非正整数等），响应体含中文原因。
+  关闭窗口结束不晚于开始或彼此重叠、容量字段非正整数、`locked` 非布尔值等），响应体含中文原因。
 - `404`：批次 ID 不存在。
 
 ---
@@ -204,7 +267,7 @@ curl -s http://localhost:8000/api/v1/batches/<batch_id>
 ```
 
 `sample.json` 已随仓库提供（36L 跑道含关闭窗口与「10 分钟内最多 3 架」滚动容量约束，
-18R 跑道含关闭窗口），可直接使用。
+首航 CA101 标记为 `locked`；18R 跑道含关闭窗口），可直接使用。
 
 ---
 
@@ -218,7 +281,7 @@ export WAKE_DB_PATH=./wake.db            # 可选，默认 /data/wake.db
 uvicorn app.main:app --reload --port 8000
 ```
 
-运行测试（含 55 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
+运行测试（含 74 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
 
 ```bash
 python3 -m pip install pytest httpx
@@ -230,9 +293,9 @@ python3 -m pytest -q
 ```
 app/
   main.py         # FastAPI 路由（validate / trial / batches / 元信息）
-  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量合法性与兼容序列化）
+  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定合法性与兼容序列化）
   service.py      # 请求 -> 领域对象 -> 模式计算
-  separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、默认矩阵
+  separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、锁定航班可行性（blocker）、默认矩阵
   timeutils.py    # 时区归一化（统一 UTC，整数秒运算）
   database.py     # SQLite 连接、建表与旧库迁移
   repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排结果的持久化与回查

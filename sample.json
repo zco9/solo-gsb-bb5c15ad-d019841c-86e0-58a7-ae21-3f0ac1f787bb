@@ -3,7 +3,7 @@
     {
       "runway": "36L",
       "flights": [
-        {"flight_no": "CA101", "scheduled_off": "2026-09-18T08:00:00+08:00", "wake": "J"},
+        {"flight_no": "CA101", "scheduled_off": "2026-09-18T08:00:00+08:00", "wake": "J", "locked": true},
         {"flight_no": "CA102", "scheduled_off": "2026-09-18T08:01:00+08:00", "wake": "M"},
         {"flight_no": "CA103", "scheduled_off": "2026-09-18T08:02:30+08:00", "wake": "M"},
         {"flight_no": "CA104", "scheduled_off": "2026-09-18T08:03:00+08:00", "wake": "L"}

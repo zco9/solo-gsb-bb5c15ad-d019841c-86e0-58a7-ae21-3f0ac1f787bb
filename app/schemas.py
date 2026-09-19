@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import (
     BaseModel,
@@ -24,6 +25,12 @@ class FlightIn(BaseModel):
         ..., description="计划离场时刻，ISO 8601，必须带时区，例如 2026-09-18T08:00:00+08:00"
     )
     wake: Wake = Field(..., description="尾流等级: L 轻型 / M 中型 / H 重型 / J 超重型")
+    locked: bool = Field(
+        default=False,
+        strict=True,
+        description="是否为不可移动航班：试排中必须保持 scheduled_off，"
+        "缺省为 false。validate 仍按原计划校验并回显锁定状态。",
+    )
 
     @field_validator("flight_no")
     @classmethod
@@ -227,6 +234,67 @@ class ViolationOut(BaseModel):
     follower_position: int
 
 
+class LockedFlightOut(BaseModel):
+    position: int
+    flight_no: str
+    scheduled_off: datetime
+    wake: Wake
+
+
+class TrialBlockedOut(BaseModel):
+    """First locked flight the trial cannot keep on its scheduled time."""
+
+    flight_no: str
+    wake: Wake
+    scheduled_off: datetime
+    position: int
+    constraint: Literal["wake", "closure", "capacity"]
+    required_earliest_off: datetime
+    # wake detail
+    triggered_by: str | None
+    required_gap_seconds: int | None
+    # closure detail
+    closure_hit: bool
+    closure_window: ClosureWindowOut | None
+    # capacity detail (present only when the runway carried a capacity config)
+    has_capacity: bool = Field(default=False, exclude=True)
+    capacity_hit: bool = False
+    capacity_window_seconds: int | None = None
+    capacity_max_departures: int | None = None
+    capacity_anchor: str | None = None
+    capacity_window: ClosureWindowOut | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data = {
+            "flight_no": self.flight_no,
+            "wake": self.wake,
+            "scheduled_off": self.scheduled_off,
+            "position": self.position,
+            "constraint": self.constraint,
+            "required_earliest_off": self.required_earliest_off,
+            "triggered_by": self.triggered_by,
+            "required_gap_seconds": self.required_gap_seconds,
+            "closure_hit": self.closure_hit,
+            "closure_window": (
+                self.closure_window.model_dump()
+                if self.closure_window is not None
+                else None
+            ),
+        }
+        if self.has_capacity:
+            data["capacity_hit"] = self.capacity_hit
+            data["capacity_window_seconds"] = self.capacity_window_seconds
+            data["capacity_max_departures"] = self.capacity_max_departures
+            data["capacity_anchor"] = self.capacity_anchor
+            data["capacity_window"] = (
+                self.capacity_window.model_dump()
+                if self.capacity_window is not None
+                else None
+            )
+        return data
+
+
 class RunwayReportOut(BaseModel):
     runway: str
     order: list[str]
@@ -242,6 +310,10 @@ class RunwayReportOut(BaseModel):
     capacity: CapacityOut | None = None
     capacity_violation_count: int = 0
     capacity_violations: list[CapacityViolationOut] = Field(default_factory=list)
+    # Lock detail is emitted only when the request explicitly carried the
+    # ``locked`` field on at least one flight of this runway.
+    has_locks: bool = Field(default=False, exclude=True)
+    locked_flights: list[LockedFlightOut] = Field(default_factory=list)
 
     @model_serializer(mode="plain")
     def _serialize(self) -> dict:
@@ -265,6 +337,10 @@ class RunwayReportOut(BaseModel):
             data["capacity_violations"] = [
                 v.model_dump(mode="json") for v in self.capacity_violations
             ]
+        if self.has_locks:
+            data["locked_flights"] = [
+                f.model_dump(mode="json") for f in self.locked_flights
+            ]
         return data
 
 
@@ -281,6 +357,10 @@ class ValidateResponse(BaseModel):
     # present only when at least one runway in the batch had a capacity config.
     has_capacity: bool = Field(default=False, exclude=True)
     total_capacity_violations: int = 0
+    # Present only when at least one flight in the batch explicitly carried
+    # the ``locked`` field.
+    has_locks: bool = Field(default=False, exclude=True)
+    total_locked: int = 0
 
     @model_serializer(mode="plain")
     def _serialize(self) -> dict:
@@ -296,6 +376,8 @@ class ValidateResponse(BaseModel):
         }
         if self.has_capacity:
             data["total_capacity_violations"] = self.total_capacity_violations
+        if self.has_locks:
+            data["total_locked"] = self.total_locked
         return data
 
 
@@ -309,6 +391,9 @@ class TrialItemOut(BaseModel):
     triggered_by: str | None
     closure_hit: bool
     closure_window: ClosureWindowOut | None
+    # Echoed only when the request explicitly carried the ``locked`` field.
+    has_locks: bool = Field(default=False, exclude=True)
+    locked: bool = False
     # Capacity detail is present only when the runway carried a capacity config.
     has_capacity: bool = Field(default=False, exclude=True)
     capacity_hit: bool = False
@@ -344,6 +429,8 @@ class TrialItemOut(BaseModel):
                 if self.capacity_window is not None
                 else None
             )
+        if self.has_locks:
+            data["locked"] = self.locked
         return data
 
 
@@ -358,6 +445,11 @@ class RunwayTrialOut(BaseModel):
     items: list[TrialItemOut]
     has_capacity: bool = Field(default=False, exclude=True)
     capacity: CapacityOut | None = None
+    has_locks: bool = Field(default=False, exclude=True)
+    locked_flights: list[LockedFlightOut] = Field(default_factory=list)
+    # Set only when the first locked flight that cannot keep its scheduled
+    # time was reached; ``items`` then holds just the feasible prefix.
+    blocked: TrialBlockedOut | None = None
 
     @model_serializer(mode="plain")
     def _serialize(self) -> dict:
@@ -375,6 +467,15 @@ class RunwayTrialOut(BaseModel):
             data["capacity"] = (
                 self.capacity.model_dump() if self.capacity is not None else None
             )
+        if self.has_locks:
+            data["locked_flights"] = [
+                f.model_dump(mode="json") for f in self.locked_flights
+            ]
+            data["blocked"] = (
+                self.blocked.model_dump(mode="json")
+                if self.blocked is not None
+                else None
+            )
         return data
 
 
@@ -387,6 +488,24 @@ class TrialResponse(BaseModel):
     total_delayed: int
     total_delay_seconds: int
     runways: list[RunwayTrialOut]
+    has_locks: bool = Field(default=False, exclude=True)
+    total_locked: int = 0
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "batch_id": self.batch_id,
+            "mode": self.mode,
+            "matrix": self.matrix,
+            "total_runways": self.total_runways,
+            "total_flights": self.total_flights,
+            "total_delayed": self.total_delayed,
+            "total_delay_seconds": self.total_delay_seconds,
+            "runways": [rw.model_dump(mode="json") for rw in self.runways],
+        }
+        if self.has_locks:
+            data["total_locked"] = self.total_locked
+        return data
 
 
 class MatrixOut(BaseModel):
@@ -411,7 +530,32 @@ class BatchResponse(BaseModel):
     total_capacity_violations: int | None = None
     total_delayed: int | None = None
     total_delay_seconds: int | None = None
+    total_locked: int | None = None
     runways: list[dict]
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data = {
+            "batch_id": self.batch_id,
+            "mode": self.mode,
+            "created_at": self.created_at,
+            "matrix": self.matrix,
+            "total_runways": self.total_runways,
+            "total_flights": self.total_flights,
+            "runways": self.runways,
+        }
+        for name in (
+            "total_violations",
+            "total_closure_conflicts",
+            "total_capacity_violations",
+            "total_delayed",
+            "total_delay_seconds",
+            "total_locked",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                data[name] = value
+        return data
 
 
 def matrix_to_nested(flat: dict[tuple[str, str], int]) -> dict[str, dict[str, int]]:
