@@ -13,6 +13,7 @@ from .repository import load_batch, save_batch
 from .schemas import (
     BatchResponse,
     HealthOut,
+    InfeasibleOut,
     MatrixOut,
     RunwayReportOut,
     RunwayTrialOut,
@@ -21,7 +22,7 @@ from .schemas import (
     WakeRequest,
     default_matrix_nested,
 )
-from .separation import ClosureWindow
+from .separation import ClosureWindow, InfeasibleInfo
 from .service import nested_matrix, run_trial, run_validate
 from .config import settings
 
@@ -35,12 +36,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="跑道离场尾流间隔校验 API",
     description=(
-        "提交按跑道分组的航班计划（可附带跑道临时关闭窗口与滚动容量约束），"
-        "校验相邻离场航班的尾流间隔违规、落入关闭窗口的航班与滚动容量超限，"
-        "并支持在不改动原计划的前提下试排（向后级联延误，自动满足容量并"
-        "避开关闭窗口）。"
+        "提交按跑道分组的航班计划（可附带跑道临时关闭窗口、滚动容量约束与"
+        "不可移动 locked 航班），校验相邻离场航班的尾流间隔违规、落入关闭窗口的"
+        "航班与滚动容量超限，并支持在不改动原计划的前提下试排（向后级联延误，"
+        "自动满足容量并避开关闭窗口；锁定航班保持计划时刻，无法满足时在跑道级"
+        "报告首个不可行航班、冲突约束与所需最早时刻）。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -87,6 +89,39 @@ def _capacity_out(capacity) -> dict:
     }
 
 
+def _locked_used_by_runway(req: WakeRequest) -> dict[str, bool]:
+    """Whether any flight of the runway carried the ``locked`` key at all —
+    this (not the value) decides if locked fields join the response shape."""
+    return {
+        rw.runway: any(f.locked is not None for f in rw.flights)
+        for rw in req.runways
+    }
+
+
+def _infeasible_out(info: InfeasibleInfo) -> InfeasibleOut:
+    return InfeasibleOut(
+        flight_no=info.flight_no,
+        wake=info.wake,
+        position=info.position,
+        scheduled_off=info.scheduled_off,
+        earliest_required_off=info.earliest_required_off,
+        constraints=list(info.constraints),
+        triggered_by=info.triggered_by,
+        closure_window=(
+            _window_out(info.closure_window) if info.closure_window else None
+        ),
+        capacity_anchor=info.capacity_anchor,
+        capacity_window=(
+            {
+                "start": info.capacity_window_start,
+                "end": info.capacity_window_end,
+            }
+            if info.capacity_window_start is not None
+            else None
+        ),
+    )
+
+
 @app.post("/api/v1/validate", response_model=ValidateResponse, tags=["wake"])
 def validate(
     req: WakeRequest, db: sqlite3.Connection = Depends(get_db)
@@ -115,6 +150,7 @@ def validate(
         capacity_violations_by_runway=capacity_violations,
     )
 
+    locked_used = _locked_used_by_runway(req)
     runway_reports: list[RunwayReportOut] = []
     for runway, flights in payloads.items():
         vlist = violations[runway]
@@ -177,6 +213,8 @@ def validate(
                     }
                     for cv in cvlist
                 ],
+                has_locked=locked_used[runway],
+                locked_flights=[f.flight_no for f in flights if f.locked],
             )
         )
 
@@ -200,7 +238,9 @@ def trial(
     req: WakeRequest, db: sqlite3.Connection = Depends(get_db)
 ) -> TrialResponse:
     """保持原排序逐项推迟到最早安全时刻（满足尾流间隔、滚动容量约束且
-    避开关闭窗口）；延误向后级联，原计划不变。"""
+    避开关闭窗口）；延误向后级联，原计划不变。locked=true 的航班不可移动：
+    若约束要求将其推迟，则该跑道在首个不可行航班处停止，跑道级返回
+    infeasible（冲突约束与所需最早时刻），items 只含其前的可行前缀。"""
     payloads, matrix, windows, capacities, trials = run_trial(req)
     batch_id = save_batch(
         db,
@@ -212,15 +252,18 @@ def trial(
         trial_by_runway=trials,
     )
 
+    locked_used = _locked_used_by_runway(req)
     runway_trials: list[RunwayTrialOut] = []
     total_delayed = 0
     total_delay = 0
-    for runway, items in trials.items():
+    for runway, result in trials.items():
+        items = result.items
         delayed = [i for i in items if i.delay_seconds > 0]
         rw_delay = sum(i.delay_seconds for i in items)
         total_delayed += len(delayed)
         total_delay += rw_delay
         capacity = capacities.get(runway)
+        has_locked = locked_used[runway]
         runway_trials.append(
             RunwayTrialOut(
                 runway=runway,
@@ -232,6 +275,13 @@ def trial(
                 max_delay_seconds=max((i.delay_seconds for i in items), default=0),
                 has_capacity=capacity is not None,
                 capacity=_capacity_out(capacity) if capacity is not None else None,
+                has_locked=has_locked,
+                locked_flights=[f.flight_no for f in payloads[runway] if f.locked],
+                infeasible=(
+                    _infeasible_out(result.infeasible)
+                    if result.infeasible is not None
+                    else None
+                ),
                 items=[
                     {
                         "position": i.position,
@@ -258,6 +308,8 @@ def trial(
                             else None
                         ),
                         "has_capacity": capacity is not None,
+                        "has_locked": has_locked,
+                        "locked": i.locked,
                     }
                     for i in items
                 ],
@@ -268,7 +320,7 @@ def trial(
         batch_id=batch_id,
         matrix=nested_matrix(matrix),
         total_runways=len(trials),
-        total_flights=sum(len(i) for i in trials.values()),
+        total_flights=sum(len(r.items) for r in trials.values()),
         total_delayed=total_delayed,
         total_delay_seconds=total_delay,
         runways=runway_trials,

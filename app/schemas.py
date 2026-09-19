@@ -24,6 +24,11 @@ class FlightIn(BaseModel):
         ..., description="计划离场时刻，ISO 8601，必须带时区，例如 2026-09-18T08:00:00+08:00"
     )
     wake: Wake = Field(..., description="尾流等级: L 轻型 / M 中型 / H 重型 / J 超重型")
+    locked: bool | None = Field(
+        default=None,
+        description="不可移动标记：true 表示试排时该航班必须保持 scheduled_off 不变；"
+        "缺省（不传）视为未锁定且响应保持旧形状。",
+    )
 
     @field_validator("flight_no")
     @classmethod
@@ -242,6 +247,10 @@ class RunwayReportOut(BaseModel):
     capacity: CapacityOut | None = None
     capacity_violation_count: int = 0
     capacity_violations: list[CapacityViolationOut] = Field(default_factory=list)
+    # Locked-flight echo is emitted only when at least one flight of the
+    # runway carried the ``locked`` key in the request.
+    has_locked: bool = Field(default=False, exclude=True)
+    locked_flights: list[str] = Field(default_factory=list)
 
     @model_serializer(mode="plain")
     def _serialize(self) -> dict:
@@ -257,6 +266,8 @@ class RunwayReportOut(BaseModel):
                 c.model_dump(mode="json") for c in self.closure_conflicts
             ],
         }
+        if self.has_locked:
+            data["locked_flights"] = self.locked_flights
         if self.has_capacity:
             data["capacity"] = (
                 self.capacity.model_dump() if self.capacity is not None else None
@@ -316,6 +327,9 @@ class TrialItemOut(BaseModel):
     capacity_max_departures: int | None = None
     capacity_anchor: str | None = None
     capacity_window: ClosureWindowOut | None = None
+    # Locked flag is present only when the runway's request used ``locked``.
+    has_locked: bool = Field(default=False, exclude=True)
+    locked: bool = False
 
     @model_serializer(mode="plain")
     def _serialize(self) -> dict:
@@ -334,10 +348,56 @@ class TrialItemOut(BaseModel):
                 else None
             ),
         }
+        if self.has_locked:
+            data["locked"] = self.locked
         if self.has_capacity:
             data["capacity_hit"] = self.capacity_hit
             data["capacity_window_seconds"] = self.capacity_window_seconds
             data["capacity_max_departures"] = self.capacity_max_departures
+            data["capacity_anchor"] = self.capacity_anchor
+            data["capacity_window"] = (
+                self.capacity_window.model_dump()
+                if self.capacity_window is not None
+                else None
+            )
+        return data
+
+
+class InfeasibleOut(BaseModel):
+    """First locked flight whose scheduled time cannot be kept (trial stops
+    here for this runway). Per-constraint detail keys are emitted only for
+    the constraints listed in ``constraints``."""
+
+    flight_no: str
+    wake: Wake
+    position: int
+    scheduled_off: datetime
+    earliest_required_off: datetime
+    constraints: list[str]
+    triggered_by: str | None = None
+    closure_window: ClosureWindowOut | None = None
+    capacity_anchor: str | None = None
+    capacity_window: ClosureWindowOut | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "flight_no": self.flight_no,
+            "wake": self.wake,
+            "position": self.position,
+            "scheduled_off": self.scheduled_off,
+            "earliest_required_off": self.earliest_required_off,
+            "constraints": self.constraints,
+        }
+        if "wake" in self.constraints:
+            data["triggered_by"] = self.triggered_by
+        if "closure" in self.constraints:
+            data["closure_window"] = (
+                self.closure_window.model_dump()
+                if self.closure_window is not None
+                else None
+            )
+        if "capacity" in self.constraints:
             data["capacity_anchor"] = self.capacity_anchor
             data["capacity_window"] = (
                 self.capacity_window.model_dump()
@@ -358,6 +418,13 @@ class RunwayTrialOut(BaseModel):
     items: list[TrialItemOut]
     has_capacity: bool = Field(default=False, exclude=True)
     capacity: CapacityOut | None = None
+    # Locked-flight fields are emitted only when the runway's request used
+    # the ``locked`` key; ``infeasible`` reports the first locked flight that
+    # cannot keep its slot (null when every locked flight is feasible), and
+    # ``items`` then holds only the feasible prefix ahead of it.
+    has_locked: bool = Field(default=False, exclude=True)
+    locked_flights: list[str] = Field(default_factory=list)
+    infeasible: InfeasibleOut | None = None
 
     @model_serializer(mode="plain")
     def _serialize(self) -> dict:
@@ -371,6 +438,13 @@ class RunwayTrialOut(BaseModel):
             "max_delay_seconds": self.max_delay_seconds,
             "items": [i.model_dump(mode="json") for i in self.items],
         }
+        if self.has_locked:
+            data["locked_flights"] = self.locked_flights
+            data["infeasible"] = (
+                self.infeasible.model_dump(mode="json")
+                if self.infeasible is not None
+                else None
+            )
         if self.has_capacity:
             data["capacity"] = (
                 self.capacity.model_dump() if self.capacity is not None else None

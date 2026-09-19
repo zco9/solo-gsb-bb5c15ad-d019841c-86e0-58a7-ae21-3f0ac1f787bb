@@ -620,3 +620,223 @@ def test_batch_roundtrip_preserves_capacity(client):
     assert t36l["items"] == next(
         x for x in t["runways"] if x["runway"] == "36L"
     )["items"]
+
+
+# ---------- locked (immovable) flights ----------
+
+
+LOCKED_BODY = {
+    "runways": [
+        {
+            "runway": "36L",
+            "flights": [
+                _flight("CA101", "2026-09-18T00:00:00Z", "J"),
+                _flight("CA102", "2026-09-18T00:01:00Z", "M"),
+                {**_flight("CA103", "2026-09-18T00:02:30Z", "M"), "locked": True},
+                _flight("CA104", "2026-09-18T00:03:00Z", "L"),
+            ],
+            "closures": [
+                {"start": "2026-09-18T00:02:30Z", "end": "2026-09-18T00:03:30Z"}
+            ],
+            "capacity": {"window_seconds": 600, "max_departures": 3},
+        },
+        {
+            "runway": "18R",
+            "flights": [
+                _flight("MU201", "2026-09-18T00:00:00Z", "H"),
+                {**_flight("MU202", "2026-09-18T00:03:00Z", "H"), "locked": True},
+            ],
+        },
+    ]
+}
+
+
+def test_validate_echoes_locked_flights_and_still_validates_the_plan(client):
+    r = client.post("/api/v1/validate", json=LOCKED_BODY)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    rw36l = next(rw for rw in data["runways"] if rw["runway"] == "36L")
+    assert rw36l["locked_flights"] == ["CA103"]
+    # the original plan is validated exactly as before, lock or no lock
+    assert rw36l["violation_count"] == 2  # CA101->CA102, CA103->CA104
+    # CA103 (00:02:30) and CA104 (00:03:00) both sit in [00:02:30, 00:03:30)
+    assert rw36l["closure_conflict_count"] == 2
+    assert [c["flight_no"] for c in rw36l["closure_conflicts"]] == ["CA103", "CA104"]
+    assert rw36l["capacity_violation_count"] == 1
+    assert rw36l["capacity_violations"][0]["flight_no"] == "CA104"
+
+    rw18r = next(rw for rw in data["runways"] if rw["runway"] == "18R")
+    assert rw18r["locked_flights"] == ["MU202"]
+    assert rw18r["violation_count"] == 0
+
+
+def test_locked_absent_keeps_legacy_response_shape(client):
+    v = client.post("/api/v1/validate", json=VALIDATE_BODY).json()
+    for rw in v["runways"]:
+        assert "locked_flights" not in rw
+
+    t = client.post("/api/v1/trial", json=VALIDATE_BODY).json()
+    for rw in t["runways"]:
+        assert "locked_flights" not in rw
+        assert "infeasible" not in rw
+        for item in rw["items"]:
+            assert "locked" not in item
+
+    # batch replay of a locked-less batch stays legacy-shaped too
+    got = client.get(f"/api/v1/batches/{t['batch_id']}").json()
+    for rw in got["runways"]:
+        assert "locked_flights" not in rw
+        assert "infeasible" not in rw
+        for item in rw["items"]:
+            assert "locked" not in item
+
+
+def test_trial_locked_infeasible_returns_first_blocked_flight(client):
+    r = client.post("/api/v1/trial", json=LOCKED_BODY)
+    assert r.status_code == 200, r.text
+    data = r.json()
+
+    rw = next(rw for rw in data["runways"] if rw["runway"] == "36L")
+    assert rw["locked_flights"] == ["CA103"]
+    # feasible prefix only: CA103 (locked, blocked) and CA104 get no proposal
+    assert rw["order"] == ["CA101", "CA102"]
+    assert rw["total"] == 2
+    items = {i["flight_no"]: i for i in rw["items"]}
+    assert items["CA101"]["locked"] is False
+    assert items["CA101"]["delay_seconds"] == 0
+    # CA102: wake push to 00:03:00 lands in the closure -> 00:03:30
+    assert items["CA102"]["adjusted_off"] == "2026-09-18T00:03:30Z"
+    assert items["CA102"]["closure_hit"] is True
+
+    inf = rw["infeasible"]
+    assert inf["flight_no"] == "CA103"
+    assert inf["wake"] == "M"
+    assert inf["position"] == 3
+    assert inf["scheduled_off"] == "2026-09-18T00:02:30Z"
+    # wake (CA102 adjusted 00:03:30 + 60 = 00:04:30) conflicts with the locked
+    # slot, and the slot itself sits inside the closure window
+    assert inf["constraints"] == ["wake", "closure"]
+    assert inf["triggered_by"] == "CA102"
+    assert inf["closure_window"] == {
+        "start": "2026-09-18T00:02:30Z",
+        "end": "2026-09-18T00:03:30Z",
+    }
+    assert inf["earliest_required_off"] == "2026-09-18T00:04:30Z"
+    assert "capacity_anchor" not in inf  # capacity never bound for CA103
+
+    # 18R: locked MU202 keeps its slot (00:03:00 >= 00:00:00 + 100)
+    rw18 = next(rw for rw in data["runways"] if rw["runway"] == "18R")
+    assert rw18["locked_flights"] == ["MU202"]
+    assert rw18["infeasible"] is None
+    assert [i["flight_no"] for i in rw18["items"]] == ["MU201", "MU202"]
+    mu202 = rw18["items"][1]
+    assert mu202["locked"] is True
+    assert mu202["adjusted_off"] == "2026-09-18T00:03:00Z"
+    assert mu202["delay_seconds"] == 0
+
+    # batch totals aggregate the feasible prefix
+    assert data["total_flights"] == 4  # 2 (36L prefix) + 2 (18R)
+    assert data["total_delayed"] == 1
+    assert data["total_delay_seconds"] == 150
+
+
+def test_trial_locked_capacity_conflict_reports_capacity_detail(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:00Z", "M"),
+                    _flight("CA2", "2026-09-18T00:00:30Z", "M"),
+                    {**_flight("CA3", "2026-09-18T00:00:59Z", "M"), "locked": True},
+                    _flight("CA4", "2026-09-18T00:02:00Z", "M"),
+                ],
+                "capacity": {"window_seconds": 60, "max_departures": 2},
+            }
+        ],
+        "matrix": [{"leader": "M", "follower": "M", "seconds": 0}],
+    }
+    data = client.post("/api/v1/trial", json=body).json()
+    rw = data["runways"][0]
+    assert [i["flight_no"] for i in rw["items"]] == ["CA1", "CA2"]
+    inf = rw["infeasible"]
+    assert inf["flight_no"] == "CA3"
+    assert inf["constraints"] == ["capacity"]
+    assert inf["capacity_anchor"] == "CA1"
+    assert inf["capacity_window"] == {
+        "start": "2026-09-18T00:00:00Z",
+        "end": "2026-09-18T00:01:00Z",
+    }
+    assert inf["earliest_required_off"] == "2026-09-18T00:01:00Z"
+    assert "triggered_by" not in inf
+    assert "closure_window" not in inf
+
+
+def test_locked_false_explicitly_still_uses_locked_shape(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    {**_flight("CA1", "2026-09-18T00:00:00Z", "H"), "locked": False},
+                    _flight("CA2", "2026-09-18T00:02:00Z", "M"),
+                ],
+            }
+        ]
+    }
+    v = client.post("/api/v1/validate", json=body).json()
+    assert v["runways"][0]["locked_flights"] == []
+
+    t = client.post("/api/v1/trial", json=body).json()
+    rw = t["runways"][0]
+    assert rw["locked_flights"] == []
+    assert rw["infeasible"] is None
+    assert [i["locked"] for i in rw["items"]] == [False, False]
+
+
+def test_locked_fields_are_per_runway(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    {**_flight("CA1", "2026-09-18T00:00:00Z", "M"), "locked": True}
+                ],
+            },
+            {"runway": "18R", "flights": [_flight("MU1", "2026-09-18T00:00:00Z", "M")]},
+        ]
+    }
+    v = client.post("/api/v1/validate", json=body).json()
+    rw36l = next(rw for rw in v["runways"] if rw["runway"] == "36L")
+    rw18r = next(rw for rw in v["runways"] if rw["runway"] == "18R")
+    assert rw36l["locked_flights"] == ["CA1"]
+    assert "locked_flights" not in rw18r
+
+    t = client.post("/api/v1/trial", json=body).json()
+    t36l = next(rw for rw in t["runways"] if rw["runway"] == "36L")
+    t18r = next(rw for rw in t["runways"] if rw["runway"] == "18R")
+    assert t36l["items"][0]["locked"] is True
+    assert t36l["infeasible"] is None
+    assert "locked" not in t18r["items"][0]
+    assert "infeasible" not in t18r
+
+
+def test_batch_roundtrip_with_locked(client):
+    t = client.post("/api/v1/trial", json=LOCKED_BODY).json()
+    got_t = client.get(f"/api/v1/batches/{t['batch_id']}").json()
+    assert got_t["mode"] == "trial"
+    # feasible prefix + infeasible report replay exactly as first returned
+    # (batch replay lists runways sorted by name, so compare per runway)
+    for rw in t["runways"]:
+        got_rw = next(x for x in got_t["runways"] if x["runway"] == rw["runway"])
+        assert got_rw == rw
+    assert got_t["total_flights"] == t["total_flights"]
+    inf = next(rw for rw in got_t["runways"] if rw["runway"] == "36L")["infeasible"]
+    assert inf["flight_no"] == "CA103"
+    assert inf["constraints"] == ["wake", "closure"]
+
+    v = client.post("/api/v1/validate", json=LOCKED_BODY).json()
+    got_v = client.get(f"/api/v1/batches/{v['batch_id']}").json()
+    for rw in v["runways"]:
+        got_rw = next(x for x in got_v["runways"] if x["runway"] == rw["runway"])
+        assert got_rw == rw

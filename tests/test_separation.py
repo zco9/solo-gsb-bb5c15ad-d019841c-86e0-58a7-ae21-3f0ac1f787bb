@@ -88,7 +88,7 @@ def test_trial_cascades_delays_without_mutating_originals():
         make("CA2", 60, "M"),    # pushed to 180 (triggered by CA1), delay 120
         make("CA3", 200, "M"),   # must be >= 240 (triggered by CA2), delay 40
     ]
-    items = trial_reschedule(flights, build_matrix(None))
+    items = trial_reschedule(flights, build_matrix(None)).items
     assert [i.flight_no for i in items] == ["CA1", "CA2", "CA3"]
     assert items[0].delay_seconds == 0
     assert items[0].triggered_by is None
@@ -106,7 +106,7 @@ def test_trial_cascades_delays_without_mutating_originals():
 
 def test_trial_never_moves_flight_earlier():
     flights = [make("CA1", 1000, "M"), make("CA2", 5000, "M")]
-    items = trial_reschedule(flights, build_matrix(None))
+    items = trial_reschedule(flights, build_matrix(None)).items
     assert items[1].delay_seconds == 0
     assert items[1].adjusted_time == dt(5000)
 
@@ -114,7 +114,7 @@ def test_trial_never_moves_flight_earlier():
 def test_trial_with_custom_matrix():
     matrix = build_matrix({("H", "H"): 300})
     flights = [make("CA1", 0, "H"), make("CA2", 100, "H")]
-    items = trial_reschedule(flights, matrix)
+    items = trial_reschedule(flights, matrix).items
     assert items[1].adjusted_time == dt(300)
     assert items[1].delay_seconds == 200
     assert items[1].triggered_by == "CA1"
@@ -123,7 +123,7 @@ def test_trial_with_custom_matrix():
 def test_single_flight_has_no_violation_and_no_delay():
     flights = [make("SOLO", 42, "J")]
     assert find_violations(flights, build_matrix(None)) == []
-    (item,) = trial_reschedule(flights, build_matrix(None))
+    (item,) = trial_reschedule(flights, build_matrix(None)).items
     assert item.delay_seconds == 0 and item.triggered_by is None
 
 
@@ -166,7 +166,7 @@ def test_closure_conflicts_sorted_positions_and_window_index():
 
 def test_trial_first_flight_pushed_out_of_window():
     flights = [make("CA1", 30, "M"), make("CA2", 200, "M")]
-    items = trial_reschedule(flights, build_matrix(None), [window(0, 90)])
+    items = trial_reschedule(flights, build_matrix(None), [window(0, 90)]).items
     assert items[0].adjusted_time == dt(90)
     assert items[0].delay_seconds == 60
     assert items[0].triggered_by is None
@@ -182,7 +182,7 @@ def test_trial_wake_push_into_window_iterates_to_window_end():
     # J->M requires 180s: wake pushes CA2 from 60 to 180, which lands inside
     # the [150, 210) window, so it must move on to 210.
     flights = [make("CA1", 0, "J"), make("CA2", 60, "M")]
-    items = trial_reschedule(flights, build_matrix(None), [window(150, 210)])
+    items = trial_reschedule(flights, build_matrix(None), [window(150, 210)]).items
     assert items[1].adjusted_time == dt(210)
     assert items[1].delay_seconds == 150
     assert items[1].triggered_by == "CA1"
@@ -195,7 +195,7 @@ def test_trial_iterates_through_touching_windows():
     flights = [make("CA1", 50, "M")]
     items = trial_reschedule(
         flights, build_matrix(None), [window(0, 100), window(100, 160)]
-    )
+    ).items
     assert items[0].adjusted_time == dt(160)
     assert items[0].closure_hit is True
     assert items[0].closure_window == window(100, 160)
@@ -208,7 +208,7 @@ def test_trial_closure_delay_cascades_to_successors():
         make("CA2", 60, "M"),
         make("CA3", 220, "M"),
     ]
-    items = trial_reschedule(flights, build_matrix(None), [window(150, 210)])
+    items = trial_reschedule(flights, build_matrix(None), [window(150, 210)]).items
     assert items[1].adjusted_time == dt(210)
     assert items[2].adjusted_time == dt(270)
     assert items[2].delay_seconds == 50
@@ -220,7 +220,7 @@ def test_trial_wake_push_past_window_is_not_closure_hit():
     # wake earliest (300) already clears the [100, 200) window entirely
     flights = [make("CA1", 0, "H"), make("CA2", 150, "H")]
     matrix = build_matrix({("H", "H"): 300})
-    items = trial_reschedule(flights, matrix, [window(100, 200)])
+    items = trial_reschedule(flights, matrix, [window(100, 200)]).items
     assert items[1].adjusted_time == dt(300)
     assert items[1].triggered_by == "CA1"
     assert items[1].closure_hit is False
@@ -229,7 +229,7 @@ def test_trial_wake_push_past_window_is_not_closure_hit():
 
 def test_trial_without_windows_keeps_legacy_flags():
     flights = [make("CA1", 0, "M"), make("CA2", 10, "M")]
-    items = trial_reschedule(flights, build_matrix(None))
+    items = trial_reschedule(flights, build_matrix(None)).items
     assert all(i.closure_hit is False and i.closure_window is None for i in items)
 
 
@@ -239,7 +239,7 @@ def test_trial_without_windows_keeps_legacy_flags():
 def test_capacity_none_yields_no_violations_and_legacy_trial_fields():
     flights = [make("CA1", 0, "M"), make("CA2", 10, "M")]
     assert find_capacity_violations(flights, None) == []
-    items = trial_reschedule(flights, build_matrix(None), capacity=None)
+    items = trial_reschedule(flights, build_matrix(None), capacity=None).items
     assert all(
         i.capacity_hit is False
         and i.capacity_anchor is None
@@ -313,7 +313,7 @@ def test_capacity_sliding_window_catches_non_adjacent_overflow():
 def test_trial_capacity_pushes_overflowing_flight_to_window_end():
     flights = [make("F1", 0, "M"), make("F2", 30, "M"), make("F3", 59, "M")]
     matrix = {("M", "M"): 0}
-    items = trial_reschedule(flights, matrix, capacity=Capacity(60, 2))
+    items = trial_reschedule(flights, matrix, capacity=Capacity(60, 2)).items
     assert items[0].delay_seconds == 0 and items[0].capacity_hit is False
     assert items[1].delay_seconds == 0 and items[1].capacity_hit is False
     # F3 pushed to anchor(F1).off + 60 = 60
@@ -333,7 +333,7 @@ def test_trial_capacity_delay_cascades_through_successors():
     # k=1 (one departure per 60 s): F2 30 -> 60, F3 70 -> 120
     flights = [make("F1", 0, "M"), make("F2", 30, "M"), make("F3", 70, "M")]
     matrix = {("M", "M"): 0}
-    items = trial_reschedule(flights, matrix, capacity=Capacity(60, 1))
+    items = trial_reschedule(flights, matrix, capacity=Capacity(60, 1)).items
     assert items[1].adjusted_time == dt(60)
     assert items[2].adjusted_time == dt(120)
     assert items[2].delay_seconds == 50
@@ -350,7 +350,7 @@ def test_trial_capacity_push_into_closure_iterates_back_to_capacity():
     matrix = {("M", "M"): 0}
     items = trial_reschedule(
         flights, matrix, [window(60, 90)], Capacity(60, 2)
-    )
+    ).items
     assert items[2].adjusted_time == dt(90)
     assert items[2].capacity_hit is True
     assert items[2].closure_hit is True
@@ -370,7 +370,7 @@ def test_trial_closure_push_then_capacity_push():
     matrix = {("M", "M"): 0}
     items = trial_reschedule(
         flights, matrix, [window(30, 90)], Capacity(60, 2)
-    )
+    ).items
     assert items[1].adjusted_time == dt(90)
     assert items[1].closure_hit is True
     assert items[2].adjusted_time == dt(90)
@@ -388,9 +388,150 @@ def test_trial_closure_boundary_requires_capacity_further_push():
     matrix = {("M", "M"): 0}
     items = trial_reschedule(
         flights, matrix, [window(60, 100)], Capacity(60, 2)
-    )
+    ).items
     assert items[2].adjusted_time == dt(100)
     assert items[2].capacity_hit is True
     assert items[2].closure_hit is True
     assert items[2].capacity_anchor == "F1"
     assert items[2].closure_window == window(60, 100)
+
+
+# ---------- locked (immovable) flights ----------
+
+
+def locked_make(no: str, t: int, wake: str) -> Flight:
+    return Flight(flight_no=no, scheduled_off=dt(t), wake=wake, locked=True)
+
+
+def test_locked_flight_feasible_stays_put_and_is_flagged():
+    # CA2 locked at 200: wake J->M needs 180 -> 200 >= 0 + 180, feasible
+    flights = [make("CA1", 0, "J"), locked_make("CA2", 200, "M"), make("CA3", 300, "M")]
+    result = trial_reschedule(flights, build_matrix(None))
+    assert result.infeasible is None
+    items = result.items
+    assert [i.flight_no for i in items] == ["CA1", "CA2", "CA3"]
+    assert items[1].locked is True
+    assert items[1].adjusted_time == dt(200)
+    assert items[1].delay_seconds == 0
+    assert items[1].triggered_by is None
+    # unlocked neighbours behave as before
+    assert items[0].locked is False and items[2].locked is False
+    assert items[2].delay_seconds == 0
+
+
+def test_locked_flight_wake_conflict_stops_runway_at_first_infeasible():
+    # CA2 locked at 60 but J->M requires 180; CA3/CA4 get no suggestion
+    flights = [
+        make("CA1", 0, "J"),
+        locked_make("CA2", 60, "M"),
+        make("CA3", 300, "M"),
+        make("CA4", 400, "M"),
+    ]
+    result = trial_reschedule(flights, build_matrix(None))
+    assert [i.flight_no for i in result.items] == ["CA1"]
+    inf = result.infeasible
+    assert inf is not None
+    assert inf.flight_no == "CA2"
+    assert inf.position == 2
+    assert inf.scheduled_off == dt(60)
+    assert inf.constraints == ("wake",)
+    assert inf.triggered_by == "CA1"
+    assert inf.earliest_required_off == dt(180)
+    assert inf.closure_window is None
+    assert inf.capacity_anchor is None
+
+
+def test_locked_flight_inside_closure_is_infeasible_with_closure_detail():
+    flights = [make("CA1", 0, "M"), locked_make("CA2", 150, "M")]
+    result = trial_reschedule(flights, build_matrix(None), [window(100, 200)])
+    assert [i.flight_no for i in result.items] == ["CA1"]
+    inf = result.infeasible
+    assert inf is not None
+    assert inf.constraints == ("closure",)
+    assert inf.triggered_by is None
+    assert inf.closure_window == window(100, 200)
+    assert inf.earliest_required_off == dt(200)
+
+
+def test_locked_flight_capacity_conflict_reports_anchor_and_window():
+    # k=2 per 60 s: locked F3 at 59 needs anchor F1@0 + 60 = 60
+    flights = [make("F1", 0, "M"), make("F2", 30, "M"), locked_make("F3", 59, "M")]
+    matrix = {("M", "M"): 0}
+    result = trial_reschedule(flights, matrix, capacity=Capacity(60, 2))
+    assert [i.flight_no for i in result.items] == ["F1", "F2"]
+    inf = result.infeasible
+    assert inf is not None
+    assert inf.constraints == ("capacity",)
+    assert inf.capacity_anchor == "F1"
+    assert inf.capacity_window_start == dt(0)
+    assert inf.capacity_window_end == dt(60)
+    assert inf.earliest_required_off == dt(60)
+
+
+def test_locked_infeasible_lists_every_binding_constraint():
+    # locked CA2 at 60: wake pushes to 180, which lands inside [150, 210)
+    # -> both wake and closure bind; earliest feasible is the window end 210
+    flights = [make("CA1", 0, "J"), locked_make("CA2", 60, "M")]
+    result = trial_reschedule(flights, build_matrix(None), [window(150, 210)])
+    assert result.items[0].flight_no == "CA1"
+    assert len(result.items) == 1
+    inf = result.infeasible
+    assert inf is not None
+    assert inf.constraints == ("wake", "closure")
+    assert inf.triggered_by == "CA1"
+    assert inf.closure_window == window(150, 210)
+    assert inf.earliest_required_off == dt(210)
+
+
+def test_locked_first_flight_infeasible_gives_empty_prefix():
+    flights = [locked_make("CA1", 30, "M"), make("CA2", 200, "M")]
+    result = trial_reschedule(flights, build_matrix(None), [window(0, 90)])
+    assert result.items == []
+    inf = result.infeasible
+    assert inf is not None
+    assert inf.flight_no == "CA1"
+    assert inf.position == 1
+    assert inf.constraints == ("closure",)
+    assert inf.earliest_required_off == dt(90)
+
+
+def test_unlocked_flights_cascade_behind_a_feasible_locked_flight():
+    # locked CA2 stays at 180; CA3 must cascade to 180 + 60 (M->M)
+    flights = [
+        make("CA1", 0, "J"),
+        locked_make("CA2", 180, "M"),
+        make("CA3", 200, "M"),
+    ]
+    result = trial_reschedule(flights, build_matrix(None))
+    assert result.infeasible is None
+    items = result.items
+    assert items[1].adjusted_time == dt(180)
+    assert items[1].locked is True
+    assert items[2].adjusted_time == dt(240)
+    assert items[2].delay_seconds == 40
+    assert items[2].triggered_by == "CA2"
+
+
+def test_locked_none_and_false_behave_like_legacy_unlocked():
+    flights = [
+        Flight(flight_no="CA1", scheduled_off=dt(0), wake="J", locked=None),
+        Flight(flight_no="CA2", scheduled_off=dt(60), wake="M", locked=False),
+    ]
+    result = trial_reschedule(flights, build_matrix(None))
+    assert result.infeasible is None
+    assert result.items[1].adjusted_time == dt(180)
+    assert result.items[1].delay_seconds == 120
+    assert all(i.locked is False for i in result.items)
+
+
+def test_locked_flight_delayed_predecessor_makes_it_infeasible():
+    # CA1 is closure-pushed to 210; locked CA2 at 240 then violates M->M 60
+    # (needs 270) even though its own schedule looked fine against the plan
+    flights = [make("CA1", 60, "M"), locked_make("CA2", 240, "M")]
+    result = trial_reschedule(flights, build_matrix(None), [window(30, 210)])
+    assert [i.flight_no for i in result.items] == ["CA1"]
+    inf = result.infeasible
+    assert inf is not None
+    assert inf.constraints == ("wake",)
+    assert inf.triggered_by == "CA1"
+    assert inf.earliest_required_off == dt(270)

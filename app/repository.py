@@ -13,7 +13,7 @@ from .separation import (
     ClosureConflict,
     ClosureWindow,
     Flight,
-    TrialItem,
+    TrialResult,
     Violation,
 )
 from .timeutils import ensure_utc
@@ -44,7 +44,7 @@ def save_batch(
     violations_by_runway: dict[str, list[Violation]] | None = None,
     closure_conflicts_by_runway: dict[str, list[ClosureConflict]] | None = None,
     capacity_violations_by_runway: dict[str, list[CapacityViolation]] | None = None,
-    trial_by_runway: dict[str, list[TrialItem]] | None = None,
+    trial_by_runway: dict[str, TrialResult] | None = None,
 ) -> str:
     batch_id = new_batch_id()
     created_at = datetime.now(timezone.utc).isoformat()
@@ -60,8 +60,8 @@ def save_batch(
     for runway, flights in runway_payloads.items():
         for position, flight in enumerate(flights, start=1):
             conn.execute(
-                "INSERT INTO flights (batch_id, runway, position, flight_no, scheduled_off, wake)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO flights (batch_id, runway, position, flight_no, scheduled_off, wake,"
+                " locked) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     batch_id,
                     runway,
@@ -69,6 +69,9 @@ def save_batch(
                     flight.flight_no,
                     _iso(flight.scheduled_off),
                     flight.wake,
+                    # None -> NULL: "locked key absent" stays distinguishable
+                    # from an explicit false on batch replay.
+                    None if flight.locked is None else int(flight.locked),
                 ),
             )
 
@@ -161,15 +164,15 @@ def save_batch(
                 ),
             )
 
-    for runway, items in (trial_by_runway or {}).items():
-        for item in items:
+    for runway, result in (trial_by_runway or {}).items():
+        for item in result.items:
             conn.execute(
                 "INSERT INTO trial_items (batch_id, runway, position, flight_no, wake,"
                 " scheduled_off, adjusted_off, delay_seconds, triggered_by,"
                 " closure_hit, closure_window_start, closure_window_end,"
                 " capacity_hit, capacity_window_seconds, capacity_max_departures,"
-                " capacity_anchor, capacity_window_start, capacity_window_end)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " capacity_anchor, capacity_window_start, capacity_window_end, locked)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     batch_id,
                     runway,
@@ -191,6 +194,40 @@ def save_batch(
                     if item.capacity_window_start
                     else None,
                     _iso(item.capacity_window_end) if item.capacity_window_end else None,
+                    int(item.locked),
+                ),
+            )
+        infeasible = result.infeasible
+        if infeasible is not None:
+            conn.execute(
+                "INSERT INTO trial_infeasible (batch_id, runway, position, flight_no, wake,"
+                " scheduled_off, earliest_required_off, constraints_json, triggered_by,"
+                " closure_window_start, closure_window_end, capacity_anchor,"
+                " capacity_window_start, capacity_window_end)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    runway,
+                    infeasible.position,
+                    infeasible.flight_no,
+                    infeasible.wake,
+                    _iso(infeasible.scheduled_off),
+                    _iso(infeasible.earliest_required_off),
+                    json.dumps(list(infeasible.constraints)),
+                    infeasible.triggered_by,
+                    _iso(infeasible.closure_window.start)
+                    if infeasible.closure_window
+                    else None,
+                    _iso(infeasible.closure_window.end)
+                    if infeasible.closure_window
+                    else None,
+                    infeasible.capacity_anchor,
+                    _iso(infeasible.capacity_window_start)
+                    if infeasible.capacity_window_start
+                    else None,
+                    _iso(infeasible.capacity_window_end)
+                    if infeasible.capacity_window_end
+                    else None,
                 ),
             )
 
@@ -215,13 +252,21 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
         matrix.setdefault(leader, {})[follower] = seconds
 
     flight_rows = conn.execute(
-        "SELECT runway, position, flight_no FROM flights"
+        "SELECT runway, position, flight_no, locked FROM flights"
         " WHERE batch_id = ? ORDER BY runway, position",
         (batch_id,),
     ).fetchall()
     order_by_runway: dict[str, list[str]] = {}
+    locked_used_by_runway: dict[str, bool] = {}
+    locked_flights_by_runway: dict[str, list[str]] = {}
     for fr in flight_rows:
         order_by_runway.setdefault(fr["runway"], []).append(fr["flight_no"])
+        if fr["locked"] is not None:
+            locked_used_by_runway[fr["runway"]] = True
+            if fr["locked"]:
+                locked_flights_by_runway.setdefault(fr["runway"], []).append(
+                    fr["flight_no"]
+                )
 
     closure_rows = conn.execute(
         "SELECT runway, window_index, start_utc, end_utc FROM closures"
@@ -323,6 +368,8 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
                 "closure_conflict_count": len(conflicts),
                 "closure_conflicts": conflicts,
             }
+            if locked_used_by_runway.get(runway):
+                report["locked_flights"] = locked_flights_by_runway.get(runway, [])
             if runway in capacities_by_runway:
                 cap_violations = cap_violations_by_runway.get(runway, [])
                 report["capacity"] = capacities_by_runway[runway]
@@ -372,6 +419,9 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
             "closure_hit": bool(tr["closure_hit"]),
             "closure_window": closure_window,
         }
+        runway_has_locked = locked_used_by_runway.get(tr["runway"], False)
+        if runway_has_locked:
+            item["locked"] = bool(tr["locked"])
         runway_has_capacity = tr["runway"] in capacities_by_runway
         if runway_has_capacity:
             capacity_window = None
@@ -386,9 +436,42 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
             item["capacity_anchor"] = tr["capacity_anchor"]
             item["capacity_window"] = capacity_window
         items_by_runway.setdefault(tr["runway"], []).append(item)
+
+    irows = conn.execute(
+        "SELECT * FROM trial_infeasible WHERE batch_id = ? ORDER BY runway",
+        (batch_id,),
+    ).fetchall()
+    infeasible_by_runway: dict[str, dict] = {}
+    for ir in irows:
+        constraints = json.loads(ir["constraints_json"])
+        report_infeasible = {
+            "flight_no": ir["flight_no"],
+            "wake": ir["wake"],
+            "position": ir["position"],
+            "scheduled_off": _dt(ir["scheduled_off"]),
+            "earliest_required_off": _dt(ir["earliest_required_off"]),
+            "constraints": constraints,
+        }
+        # per-constraint detail keys mirror the POST serializer exactly
+        if "wake" in constraints:
+            report_infeasible["triggered_by"] = ir["triggered_by"]
+        if "closure" in constraints:
+            report_infeasible["closure_window"] = {
+                "start": _dt(ir["closure_window_start"]),
+                "end": _dt(ir["closure_window_end"]),
+            }
+        if "capacity" in constraints:
+            report_infeasible["capacity_anchor"] = ir["capacity_anchor"]
+            report_infeasible["capacity_window"] = {
+                "start": _dt(ir["capacity_window_start"]),
+                "end": _dt(ir["capacity_window_end"]),
+            }
+        infeasible_by_runway[ir["runway"]] = report_infeasible
+
     runways = []
     total_delayed = 0
     total_delay = 0
+    total_items = 0
     for runway in order_by_runway:
         items = items_by_runway.get(runway, [])
         delayed = [i for i in items if i["delay_seconds"] > 0]
@@ -396,9 +479,10 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
         max_delay = max((i["delay_seconds"] for i in items), default=0)
         total_delayed += len(delayed)
         total_delay += rw_delay
+        total_items += len(items)
         runway_report = {
             "runway": runway,
-            "order": order_by_runway[runway],
+            "order": [i["flight_no"] for i in items],
             "total": len(items),
             "closures": closures_by_runway.get(runway, []),
             "delayed_count": len(delayed),
@@ -406,6 +490,9 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
             "max_delay_seconds": max_delay,
             "items": items,
         }
+        if locked_used_by_runway.get(runway):
+            runway_report["locked_flights"] = locked_flights_by_runway.get(runway, [])
+            runway_report["infeasible"] = infeasible_by_runway.get(runway)
         if runway in capacities_by_runway:
             runway_report["capacity"] = capacities_by_runway[runway]
         runways.append(runway_report)
@@ -415,7 +502,7 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
         "created_at": row["created_at"],
         "matrix": matrix,
         "total_runways": len(runways),
-        "total_flights": sum(len(o) for o in order_by_runway.values()),
+        "total_flights": total_items,
         "total_delayed": total_delayed,
         "total_delay_seconds": total_delay,
         "runways": runways,

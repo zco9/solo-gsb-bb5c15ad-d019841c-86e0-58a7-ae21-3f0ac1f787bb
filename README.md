@@ -2,18 +2,21 @@
 
 基于 **Python + FastAPI + SQLite** 的跑道离场尾流（wake turbulence）间隔校验服务。
 客户端按跑道提交航班计划与前机—后机最小间隔矩阵，并可为每条跑道配置**临时关闭窗口**
-与**滚动容量约束**，服务端完成两件事：
+与**滚动容量约束**，航班可标记为**不可移动（locked）**，服务端完成两件事：
 
 1. **间隔校验（validate）**：按计划离场时刻、航班号稳定排序，列出同跑道相邻航班的间隔违规、
    计划离场时刻落入关闭窗口的航班及其命中窗口，以及滚动容量约束的超限航班、触发窗口与
-   最早合规时刻。
+   最早合规时刻；锁定状态原样回显（`locked_flights`），校验本身不受锁定影响。
 2. **试排（trial）**：保持原航班顺序，逐项把航班推迟到**同时满足尾流间隔、滚动容量约束且
    避开关闭窗口**的最早安全时刻；容量/关闭导致的延误沿队列向后级联，
    容量推迟后若落入关闭窗口会继续迭代避让，**原计划时刻绝不改写**。
+   **锁定航班必须保持计划时刻**：若尾流、关闭窗口或容量要求会把它推迟，则不挪动它、
+   也不生成违反约束的时刻，而是在跑道级返回**首个不可行航班、冲突约束与所需最早时刻**，
+   其后的航班不再给出建议，`items` 只含可行前缀。
    返回调整后时刻、单项延误、触发前机、容量与关闭窗口命中情况。
 
-每次请求（含输入排序结果、关闭窗口、容量配置、违规/冲突/试排结论）都会持久化到 SQLite，
-可用批次 ID 回查。
+每次请求（含输入排序结果、关闭窗口、容量配置、锁定状态、违规/冲突/试排结论）都会持久化到
+SQLite，可用批次 ID 回查。
 
 ---
 
@@ -72,9 +75,13 @@ docker compose up -d --build
 - `flight_no`：航班号，**整个请求内唯一**（跑道内、跑道间均不可重复）。
 - `scheduled_off`：计划离场时刻，ISO 8601 且**必须带时区**（`Z` 或 `+08:00` 偏移），服务端统一按 UTC 处理。
 - `wake`：尾流等级，四档 —— `L` 轻型 / `M` 中型 / `H` 重型 / `J` 超重型。
+- `locked`（可选）：`true` 表示该航班**不可移动**（详见下文「不可移动航班」）；
+  不传该字段时响应保持旧形状，不出现任何锁定相关字段。
 - 跑道按其标识独立排序与校验；排序规则为 `(scheduled_off 升序, flight_no 升序)` 的稳定排序。
 - 仅检查排序后**相邻**两架航班（单跑道离场的运行惯例）：前机尾流等级 → 后机尾流等级查矩阵，
   实际间隔 < 要求间隔即违规，返回要求秒数、实际秒数与缺口秒数。
+- 跑道内有航班传了 `locked` 时，该跑道额外回显 **`locked_flights`**（锁定航班号，按稳定排序），
+  校验结论（违规/关闭冲突/容量超限）仍完全按计划时刻计算，不受锁定影响。
 
 #### 跑道临时关闭窗口（可选字段 `closures`）
 
@@ -137,6 +144,49 @@ validate 额外返回**关闭冲突**：凡计划离场时刻落在某个窗口�
   未因容量推迟为 `null`），跑道对象同时原样回显 `capacity`；
 - 该接口只返回试排建议，`scheduled_off` 原值原样返回，数据库中也同时保存原计划。
 
+#### 不可移动航班（可选字段 `locked`）
+
+航班可携带 `"locked": true` 标记为不可移动：
+
+```json
+{"flight_no": "CA103", "scheduled_off": "2026-09-18T08:02:30+08:00", "wake": "M", "locked": true}
+```
+
+- 试排时锁定航班**必须保持 `scheduled_off`**（`adjusted_off == scheduled_off`、`delay_seconds = 0`），
+  未锁定航班仍只会向后推迟；锁定航班自身可行时，其前序航班的延误照常级联到它之后的未锁定航班。
+- 按现有稳定顺序计算时，若尾流间隔、关闭窗口或滚动容量**任一约束要求把某架锁定航班推迟**，
+  服务端**不挪动它、也不生成违反约束的时刻**，而是让该跑道在首个不可行航班处停止，
+  并在跑道级返回 **`infeasible`**：
+
+  ```json
+  "infeasible": {
+    "flight_no": "CA103",
+    "wake": "M",
+    "position": 3,
+    "scheduled_off": "2026-09-18T00:02:30Z",
+    "earliest_required_off": "2026-09-18T00:04:30Z",
+    "constraints": ["wake", "closure"],
+    "triggered_by": "CA102",
+    "closure_window": {"start": "2026-09-18T00:02:30Z", "end": "2026-09-18T00:03:30Z"}
+  }
+  ```
+
+  - `constraints`：冲突约束列表，取值子集为 `wake`（尾流）/ `closure`（关闭窗口）/ `capacity`
+    （滚动容量）——既包括**计划时刻本身违反**的约束（如计划时刻落在关闭窗口内），
+    也包括**推导最早可行时刻过程中触发**的约束（如尾流推迟后落入更晚的窗口）；
+  - `earliest_required_off`：所需最早时刻，即该航班若不锁定、满足全部约束的最早离场时刻；
+  - 每种冲突约束附带对应明细键：`wake` → `triggered_by`（直接前机）、
+    `closure` → `closure_window`、`capacity` → `capacity_anchor` 与 `capacity_window`，
+    未涉及的约束不出现对应键；
+  - 该跑道 `items` 只含首个不可行航班**之前的可行前缀**，其后的航班不再给出建议；
+    `order` / `total` / 延误汇总与批次级 `total_flights` 等均按可行前缀统计；
+    全部锁定航班可行时 `infeasible` 为 `null`；
+  - 其它跑道互不影响，照常给出完整试排。
+- 跑道内有航班传了 `locked` 时，该跑道回显 `locked_flights`，且每个试排项带 `locked` 标记；
+  **未传 `locked` 的跑道/请求保持旧响应形状**，不出现上述任何字段。
+- 可行前缀与 `infeasible` 报告照常持久化，批次回查（`GET /api/v1/batches/{batch_id}`）
+  返回与 POST 一致的内容。
+
 ### `POST` 边界示例
 
 | 场景 | 计划 / 配置（窗口 60 秒、容量 2 架） | validate 结论 | trial 调整 |
@@ -144,14 +194,16 @@ validate 额外返回**关闭冲突**：凡计划离场时刻落在某个窗口�
 | 恰好装满 | 00:00、00:30、01:00 | 无超限（锚机 00:00 的窗口 `[00:00,01:00)` 右端不含） | 全部不动 |
 | 第三架落入 | 00:00、00:30、**00:59** | CA3 超限；触发窗口 `[00:00,01:00)`，`departures_in_window=3`，最早合规 `01:00` | CA3 → **01:00**（`capacity_hit=true`，锚机 CA1） |
 | 容量推迟撞关闭 | 00:00、00:30、00:59；关闭 `[01:00,01:40)` | 同上 | CA3 → 01:00 撞窗口 → **01:40**（`capacity_hit` 与 `closure_hit` 均为 `true`） |
+| 锁定航班不可行 | 00:00、00:30、**00:59（locked=true）**、02:00 | CA3 超限，最早合规 `01:00` | CA3 不可移动：`infeasible.constraints=["capacity"]`、`earliest_required_off=01:00`；`items` 只含 CA1、CA2，02:00 的航班不再给出建议 |
 | 窗口滑动 | 00:00、00:40、01:20、02:00（窗口 90 秒、2 架） | 第 3 架（锚机第 1 架，跨度 80 < 90）、第 4 架（锚机第 2 架，跨度 80 < 90）各一次 | 逐项推迟到锚机 + 90 秒，向后级联 |
 
 ### `GET /api/v1/batches/{batch_id}` — 批次回查
 
 两个 POST 接口的返回都带 `batch_id`，可随时回查当时的输入顺序、生效矩阵、关闭窗口、
 容量配置与结论（validate 的违规/关闭冲突/容量超限 / trial 的试排结果），字段与 POST 响应一致：
-配置了 capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的跑道**不出现**容量字段，
-保持旧响应形状。不存在的 ID 返回 `404`。
+配置了 capacity 的跑道回显 `capacity` 及容量结论/试排明细，传了 `locked` 的跑道回显
+`locked_flights`、逐项 `locked` 标记与 `infeasible` 报告（可行前缀），未配置/未传 locked 的跑道
+**不出现**对应字段，保持旧响应形状。不存在的 ID 返回 `404`。
 
 ### 间隔矩阵（可选字段 `matrix`）
 
@@ -199,12 +251,19 @@ curl -s -X POST http://localhost:8000/api/v1/trial \
   -H 'Content-Type: application/json' \
   -d @sample.json
 
+# 含不可移动航班的试排（36L 的 CA103 锁定且不可行，18R 的 MU56 锁定但可行）
+curl -s -X POST http://localhost:8000/api/v1/trial \
+  -H 'Content-Type: application/json' \
+  -d @sample_locked.json
+
 # 回查批次
 curl -s http://localhost:8000/api/v1/batches/<batch_id>
 ```
 
 `sample.json` 已随仓库提供（36L 跑道含关闭窗口与「10 分钟内最多 3 架」滚动容量约束，
-18R 跑道含关闭窗口），可直接使用。
+18R 跑道含关闭窗口），可直接使用；`sample_locked.json` 额外演示锁定航班：
+36L 的 CA103 锁定在关闭窗口内且与前机间隔不足（trial 返回 `infeasible`，
+`constraints` 为 `["wake", "closure"]`），18R 的 MU56 锁定但可行（保持计划时刻）。
 
 ---
 
@@ -218,7 +277,7 @@ export WAKE_DB_PATH=./wake.db            # 可选，默认 /data/wake.db
 uvicorn app.main:app --reload --port 8000
 ```
 
-运行测试（含 55 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
+运行测试（含 71 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
 
 ```bash
 python3 -m pip install pytest httpx
@@ -230,16 +289,17 @@ python3 -m pytest -q
 ```
 app/
   main.py         # FastAPI 路由（validate / trial / batches / 元信息）
-  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量合法性与兼容序列化）
+  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定合法性与兼容序列化）
   service.py      # 请求 -> 领域对象 -> 模式计算
-  separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、默认矩阵
+  separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、锁定航班不可行判定、默认矩阵
   timeutils.py    # 时区归一化（统一 UTC，整数秒运算）
   database.py     # SQLite 连接、建表与旧库迁移
-  repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排结果的持久化与回查
+  repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排结果（含锁定与不可行报告）的持久化与回查
   config.py       # 环境变量配置
 tests/            # pytest 领域单测 + TestClient API 测试
 Dockerfile
 docker-compose.yml
-sample.json       # 含关闭窗口与滚动容量约束的示例请求
+sample.json        # 含关闭窗口与滚动容量约束的示例请求
+sample_locked.json # 含不可移动（locked）航班的示例请求
 requirements.txt
 ```

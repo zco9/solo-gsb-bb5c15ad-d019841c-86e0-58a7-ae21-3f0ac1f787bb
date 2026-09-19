@@ -8,7 +8,7 @@ from .separation import (
     ClosureConflict,
     ClosureWindow,
     Flight,
-    TrialItem,
+    TrialResult,
     Violation,
     build_matrix,
     find_capacity_violations,
@@ -22,7 +22,12 @@ from .timeutils import ensure_utc
 
 
 def _build_runway_flights(req: WakeRequest) -> dict[str, list[Flight]]:
-    """Normalise every flight to UTC and return per-runway sorted lists."""
+    """Normalise every flight to UTC and return per-runway sorted lists.
+
+    ``locked`` is passed through untouched (``None`` = key absent) so the
+    persistence layer can tell "not supplied" apart from an explicit
+    ``false`` and keep legacy response shapes byte-compatible.
+    """
     payloads: dict[str, list[Flight]] = {}
     for rw in req.runways:
         flights = [
@@ -30,6 +35,7 @@ def _build_runway_flights(req: WakeRequest) -> dict[str, list[Flight]]:
                 flight_no=f.flight_no,
                 scheduled_off=ensure_utc(f.scheduled_off),
                 wake=f.wake.value,
+                locked=f.locked,
             )
             for f in rw.flights
         ]
@@ -111,7 +117,7 @@ def run_trial(req: WakeRequest) -> tuple[
     dict[tuple[str, str], int],
     dict[str, list[ClosureWindow]],
     dict[str, Capacity],
-    dict[str, list[TrialItem]],
+    dict[str, TrialResult],
 ]:
     payloads = _build_runway_flights(req)
     windows = _build_runway_windows(req)
